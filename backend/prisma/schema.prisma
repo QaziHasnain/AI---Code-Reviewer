@@ -13,12 +13,14 @@ datasource db {
 
 // User Model
 model User {
-  id        String       @id @default(uuid()) @db.Uuid
-  name      String
-  email     String       @unique
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
-  reviews   CodeReview[]
+  id           String       @id @default(uuid()) @db.Uuid
+  name         String
+  email        String       @unique
+  passwordHash String       @db.Text
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  reviews      CodeReview[]
+  sessions     Session[]
 }
 
 // CodeReview Model
@@ -69,8 +71,8 @@ model ReviewIssue {
   type           IssueType
   status         IssueStatus   @default(OPEN)
   filePath       String?
-  startLine      Int?
-  endLine        Int?
+  lineStart      Int?
+  lineEnd        Int?
   startColumn    Int?
   endColumn      Int?
   suggestedFix   String?
@@ -79,6 +81,23 @@ model ReviewIssue {
   reviewResult   ReviewResult  @relation(fields: [reviewResultId], references: [id], onDelete: Cascade)
 
   @@index([reviewResultId, severity])
+}
+
+// Session Model
+model Session {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique @db.VarChar(64)
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime?
+  revokedAt  DateTime?
+  userAgent  String?
+  ipHash     String?
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 // Native PostgreSQL Prisma Enums
