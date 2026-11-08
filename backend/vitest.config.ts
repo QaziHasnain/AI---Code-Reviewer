@@ -11,5 +11,11 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts"],
     clearMocks: true,
+    setupFiles: ["vitest.setup.ts"],
+  },
+  resolve: {
+    alias: {
+      "@": resolve(root, "src"),
+    },
   },
 });
