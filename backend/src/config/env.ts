@@ -1,4 +1,19 @@
 import { z } from "zod";
+import * as dotenv from "dotenv";
+
+// Load environment variables from .env file
+const envFilePath = process.env.NODE_ENV === "test"
+  ? ".env.test"
+  : ".env";
+
+const envResult = dotenv.config({ path: envFilePath });
+
+if (envResult.error) {
+  // For development, allow .env to be missing; for test, require it
+  if (process.env.NODE_ENV === "test") {
+    throw new Error(`Missing .env.test file: ${envResult.error.message}`);
+  }
+}
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(4000),

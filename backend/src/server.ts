@@ -1,11 +1,12 @@
-import "dotenv/config";
+import "./config/env.js";
+import env from "./config/env.js";
 import { buildApp } from "./app.js";
 
-const port = Number(process.env.PORT ?? 4000);
-const host = "0.0.0.0";
+const port = Number(env.PORT);
+const host = env.HOST;
 
 async function start(): Promise<void> {
-  const app = await buildApp();
+  const app = await buildApp({ frontendUrl: env.FRONTEND_URL });
 
   try {
     await app.listen({ port, host });
