@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { SessionService, SESSION_LIFETIME_MS } from '@/security/session/index.js';
 import { hashToken } from '@/security/token/hash.js';
 import { AuthService } from '@/security/auth/service.js';
+import { assertDedicatedTestDatabase } from '../database-safety.js';
 
 const shouldRun = process.env.RUN_SESSION_DB_INTEGRATION_TESTS === 'true'
   && Boolean(process.env.TEST_DATABASE_URL);
@@ -18,6 +19,7 @@ describe.skipIf(!shouldRun)('SessionService PostgreSQL integration', () => {
     const now = new Date('2030-01-01T00:00:00.000Z');
     const service = new SessionService(prisma);
 
+    await assertDedicatedTestDatabase(prisma);
     try {
       await prisma.user.create({
         data: { id: userId, name: 'Session Integration Test', email, passwordHash: 'test-only' },
@@ -44,6 +46,7 @@ describe.skipIf(!shouldRun)('SessionService PostgreSQL integration', () => {
       await expect(service.validateSession(second.token, now)).rejects.toMatchObject({ code: 'SESSION_REVOKED' });
     } finally {
       try {
+        await assertDedicatedTestDatabase(prisma);
         await prisma.session.deleteMany({ where: { userId } });
         await prisma.user.deleteMany({ where: { id: userId } });
       } finally {
@@ -67,12 +70,14 @@ describe.skipIf(!shouldRun)('SessionService PostgreSQL integration', () => {
       },
     };
     const service = new AuthService({ prisma, sessions });
+    await assertDedicatedTestDatabase(prisma);
     try {
       await expect(service.register({ name: 'Rollback Test', email, password: 'SecurePass123!' }))
         .rejects.toMatchObject({ code: 'OPERATION_FAILED' });
       await expect(prisma.user.findUnique({ where: { email } })).resolves.toBeNull();
       await expect(prisma.session.findUnique({ where: { tokenHash } })).resolves.toBeNull();
     } finally {
+      await assertDedicatedTestDatabase(prisma);
       await prisma.session.deleteMany({ where: { tokenHash } });
       await prisma.user.deleteMany({ where: { email } });
       await prisma.$disconnect();

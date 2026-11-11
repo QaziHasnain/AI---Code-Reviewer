@@ -67,6 +67,20 @@ describe('authentication routes', () => {
     await app.close();
   });
 
+  it('rejects oversized login requests before calling authentication or consuming a rate-limit bucket', async () => {
+    const { auth, rateLimits, appPromise } = setup();
+    const app = await appPromise;
+    expect(app.initialConfig.bodyLimit).toBe(1_048_576);
+    const response = await app.inject({
+      method: 'POST', url: '/api/auth/login', headers: originHeaders,
+      payload: { email: 'oversized@example.com', password: 'x'.repeat(1_100_000) },
+    });
+    expect(response.statusCode).toBe(413);
+    expect(auth.login).not.toHaveBeenCalled();
+    expect(rateLimits.increment).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it('does not consume a registration bucket for invalid origin and fails closed on limiter database errors', async () => {
     const { auth, rateLimits, appPromise } = setup();
     const app = await appPromise;
@@ -244,6 +258,8 @@ describe('authentication routes', () => {
       start: 900_000,
       expiresAt: new Date(1_800_000),
     });
+    expect(fixedWindow(1_799_999, 900_000)).toEqual({ start: 900_000, expiresAt: new Date(1_800_000) });
+    expect(fixedWindow(1_800_000, 900_000)).toEqual({ start: 1_800_000, expiresAt: new Date(2_700_000) });
   });
 
   it('keeps registration and login counts independent', async () => {

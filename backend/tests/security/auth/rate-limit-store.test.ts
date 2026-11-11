@@ -27,4 +27,14 @@ describe('PersistentAuthRateLimitStore', () => {
     } as never);
     await expect(store.increment('opaque-key', new Date())).rejects.toThrow('database offline');
   });
+
+  it('does not increment a bucket when expired-bucket cleanup fails', async () => {
+    const upsert = vi.fn();
+    const store = new PersistentAuthRateLimitStore({
+      deleteMany: vi.fn().mockRejectedValue(new Error('cleanup unavailable')),
+      upsert,
+    } as never);
+    await expect(store.increment('opaque-key', new Date())).rejects.toThrow('cleanup unavailable');
+    expect(upsert).not.toHaveBeenCalled();
+  });
 });

@@ -1,6 +1,11 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Tests use the dedicated TEST_DATABASE_URL contract and must never inherit a
+// developer or deployment DATABASE_URL from the shell running Vitest.
+process.env.NODE_ENV = 'test';
+delete process.env.DATABASE_URL;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = resolve(__filename, '..');
 
