@@ -13,32 +13,54 @@ datasource db {
 
 // User Model
 model User {
-  id           String       @id @default(uuid()) @db.Uuid
-  name         String
-  email        String       @unique
-  passwordHash String       @db.Text
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
-  reviews      CodeReview[]
-  sessions     Session[]
+  id                    String                 @id @default(uuid()) @db.Uuid
+  name                  String
+  email                 String                 @unique
+  passwordHash          String                 @db.Text
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  reviews               CodeReview[]
+  sessions              Session[]
+  reviewIdempotencyKeys ReviewIdempotencyKey[]
 }
 
 // CodeReview Model
 model CodeReview {
-  id                  String              @id @default(uuid()) @db.Uuid
-  userId              String              @db.Uuid
-  sourceCode          String              @db.Text
+  id                  String                 @id @default(uuid()) @db.Uuid
+  userId              String                 @db.Uuid
+  sourceCode          String                 @db.Text
   programmingLanguage ProgrammingLanguage
-  reviewStatus        ReviewStatus        @default(PENDING)
+  reviewStatus        ReviewStatus           @default(SUBMITTED)
+  instructions        String?                @db.Text
   repository          String?
   branch              String?
   commitHash          String?
-  createdAt           DateTime            @default(now())
-  updatedAt           DateTime            @updatedAt
-  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  completedAt         DateTime?
+  failedAt            DateTime?
+  failureCode         String?
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
   results             ReviewResult[]
+  idempotencyKeys     ReviewIdempotencyKey[]
 
-  @@index([userId, createdAt])
+  @@index([userId, createdAt, id])
+}
+
+model ReviewIdempotencyKey {
+  id           String     @id @default(uuid()) @db.Uuid
+  userId       String     @db.Uuid
+  key          String     @db.VarChar(128)
+  requestHash  String     @db.VarChar(64)
+  codeReviewId String     @db.Uuid
+  createdAt    DateTime   @default(now())
+  expiresAt    DateTime?
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeReview   CodeReview @relation(fields: [codeReviewId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@index([codeReviewId])
+  @@index([expiresAt])
 }
 
 // ReviewResult Model

@@ -6,6 +6,7 @@ import { SessionService } from "./security/session/index.js";
 import { startServer } from "./server-lifecycle.js";
 import { AuthService } from "./security/auth/index.js";
 import { PersistentAuthRateLimitStore } from "./security/auth/rate-limit-store.js";
+import { ReviewService } from "./reviews/service.js";
 
 const port = Number(env.PORT);
 const host = env.HOST;
@@ -15,6 +16,7 @@ async function start(): Promise<void> {
   const sessions = new SessionService(prisma);
   const auth = new AuthService({ prisma, sessions });
   const rateLimitStore = new PersistentAuthRateLimitStore(prisma.authRateLimitBucket);
+  const reviews = new ReviewService(prisma);
   await startServer({
     createApp: () => buildApp({
       frontendUrl: env.FRONTEND_URL,
@@ -23,6 +25,12 @@ async function start(): Promise<void> {
       authRoutes: {
         auth,
         sessions,
+        frontendUrl: env.FRONTEND_URL,
+        rateLimitHmacSecret: env.RATE_LIMIT_HMAC_SECRET,
+        rateLimits: rateLimitStore,
+      },
+      reviewRoutes: {
+        reviews,
         frontendUrl: env.FRONTEND_URL,
         rateLimitHmacSecret: env.RATE_LIMIT_HMAC_SECRET,
         rateLimits: rateLimitStore,

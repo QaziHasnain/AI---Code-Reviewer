@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { AuthService } from '@/security/auth/service.js';
 import { PersistentAuthRateLimitStore } from '@/security/auth/rate-limit-store.js';
@@ -12,8 +12,8 @@ describe.skipIf(!shouldRun)('Authentication routes PostgreSQL integration', () =
   it('handles concurrent duplicate registration atomically and rejects oversized bodies before rate limiting', async () => {
     const { buildApp } = await import('@/app.js');
     const { PrismaClient } = await import('@prisma/client');
-    delete process.env.DATABASE_URL;
     const prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+    delete process.env.DATABASE_URL;
     await assertDedicatedTestDatabase(prisma);
     const sessions = new SessionService(prisma);
     const app = await buildApp({
@@ -28,10 +28,12 @@ describe.skipIf(!shouldRun)('Authentication routes PostgreSQL integration', () =
       },
     });
     const email = `route-integration-${randomUUID()}@example.test`;
+    const remoteAddress = `198.51.100.${randomInt(1, 255)}`;
     try {
       const payload = { name: 'Integration', email, password: 'SecurePass123!' };
       const responses = await Promise.all(Array.from({ length: 2 }, () => app.inject({
-        method: 'POST', url: '/api/auth/register', headers: { origin: 'http://localhost:3000' }, payload,
+        method: 'POST', url: '/api/auth/register', remoteAddress,
+        headers: { origin: 'http://localhost:3000' }, payload,
       })));
       expect(responses.map((response) => response.statusCode).sort()).toEqual([201, 409]);
       const user = await prisma.user.findUnique({ where: { email } });
@@ -42,7 +44,8 @@ describe.skipIf(!shouldRun)('Authentication routes PostgreSQL integration', () =
       const before = await prisma.authRateLimitBucket.count();
       const oversizedEmail = `oversized-${randomUUID()}@example.test`;
       const oversized = await app.inject({
-        method: 'POST', url: '/api/auth/login', headers: { origin: 'http://localhost:3000' },
+        method: 'POST', url: '/api/auth/login', remoteAddress,
+        headers: { origin: 'http://localhost:3000' },
         payload: { email: oversizedEmail, password: 'x'.repeat(1_100_000) },
       });
       expect(oversized.statusCode).toBe(413);
