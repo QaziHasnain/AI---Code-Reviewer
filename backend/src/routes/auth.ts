@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { AuthError, AuthService, AUTHENTICATION_FAILED_MESSAGE, loginSchema, registerSchema } from '../security/auth/index.js';
-import { getSessionCookieName, setSessionCookie } from '../security/auth/cookie.js';
+import { clearSessionCookie, getSessionCookieName, setSessionCookie } from '../security/auth/cookie.js';
 import { SessionError } from '../security/session/index.js';
 
 const LOGIN_LIMIT = 10;
@@ -87,6 +87,34 @@ export async function authRoutes(app: FastifyInstance, dependencies: AuthRouteDe
       return safeError(reply, error);
     }
   });
+
+  app.post('/api/auth/logout', async (request, reply) => {
+    if (!sameOrigin(request, dependencies.frontendUrl)) return reply.code(403).send({ error: { code: 'ORIGIN_FORBIDDEN', message: 'Request origin is not allowed' } });
+
+    const token = sessionCookie(request);
+    if (!token) {
+      clearSessionCookie(reply);
+      return reply.code(204).send();
+    }
+
+    try {
+      await dependencies.sessions.revokeSession(token);
+    } catch (error) {
+      const inactiveSession = error instanceof SessionError
+        && ['SESSION_NOT_FOUND', 'SESSION_REVOKED', 'SESSION_EXPIRED', 'INVALID_TOKEN'].includes(error.code);
+      if (!inactiveSession) {
+        clearSessionCookie(reply);
+        return reply.code(503).send({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Authentication service unavailable' } });
+      }
+    }
+
+    clearSessionCookie(reply);
+    return reply.code(204).send();
+  });
+
+  app.get('/api/auth/me', { preHandler: app.requireAuth }, async (request) => ({
+    user: request.auth!.user,
+  }));
 }
 
 export const LOGIN_RATE_LIMIT = { limit: LOGIN_LIMIT, windowMs: LOGIN_WINDOW_MS } as const;

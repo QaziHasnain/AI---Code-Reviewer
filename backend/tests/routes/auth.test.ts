@@ -4,6 +4,7 @@ import { buildApp } from '@/app.js';
 import type { AuthService } from '@/security/auth/service.js';
 import { AuthError } from '@/security/auth/types.js';
 import type { PublicSession } from '@/security/session/types.js';
+import { SessionError } from '@/security/session/types.js';
 
 const publicUser = { id: 'user-id', name: 'Reviewer', email: 'user@example.com', createdAt: new Date('2030-01-01T00:00:00Z') };
 const publicSession: PublicSession = {
@@ -19,13 +20,18 @@ function setup(trustedProxyAddresses?: string[]) {
     login: vi.fn().mockResolvedValue(authResult),
   } as unknown as AuthService;
   const sessions = { revokeSession: vi.fn().mockResolvedValue(undefined) };
+  const authentication = {
+    sessions: { validateSession: vi.fn().mockResolvedValue(publicSession) },
+    prisma: { user: { findUnique: vi.fn().mockResolvedValue(publicUser) } },
+  };
   const rateLimits = { increment: vi.fn().mockResolvedValue(1) };
   const appPromise = buildApp({
     frontendUrl: 'http://localhost:3000',
     trustedProxyAddresses,
+    authentication,
     authRoutes: { auth, sessions, rateLimits, frontendUrl: 'http://localhost:3000', rateLimitHmacSecret: 'a'.repeat(64) },
   });
-  return { auth, sessions, rateLimits, appPromise };
+  return { auth, sessions, rateLimits, authentication, appPromise };
 }
 
 describe('authentication routes', () => {
@@ -190,5 +196,134 @@ describe('authentication routes', () => {
     await trustedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { ...originHeaders, 'x-forwarded-for': '198.51.100.8' }, payload: { email: 'user@example.com', password: 'SecurePass123!' } });
     expect(trusted.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`198.51.100.8:${windowStart}`).digest('hex'), expect.any(Date));
     await trustedApp.close();
+  });
+
+  it('logs out by revoking only the presented session and clears its cookie', async () => {
+    const { sessions, appPromise } = setup();
+    const app = await appPromise;
+    const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...originHeaders, cookie: 'session=current-token' } });
+    expect(response.statusCode).toBe(204);
+    expect(response.body).toBe('');
+    expect(sessions.revokeSession).toHaveBeenCalledExactlyOnceWith('current-token');
+    const cookieHeader = String(response.headers['set-cookie']);
+    expect(cookieHeader).toContain('session=');
+    expect(cookieHeader).toContain('HttpOnly');
+    expect(cookieHeader).toContain('SameSite=Lax');
+    expect(cookieHeader).toContain('Path=/');
+    expect(cookieHeader).toContain('Max-Age=0');
+    expect(cookieHeader).not.toContain('current-token');
+    await app.close();
+  });
+
+  it('treats logout without a cookie as idempotent and clears the cookie', async () => {
+    const { sessions, appPromise } = setup();
+    const app = await appPromise;
+    const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: originHeaders });
+    expect(response.statusCode).toBe(204);
+    expect(sessions.revokeSession).not.toHaveBeenCalled();
+    expect(String(response.headers['set-cookie'])).toContain('Max-Age=0');
+    await app.close();
+  });
+
+  it.each(['SESSION_NOT_FOUND', 'SESSION_REVOKED', 'SESSION_EXPIRED', 'INVALID_TOKEN'] as const)(
+    'treats %s as a safe idempotent logout', async (code) => {
+      const { sessions, appPromise } = setup();
+      sessions.revokeSession.mockRejectedValue(new SessionError('private session detail', code));
+      const app = await appPromise;
+      const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...originHeaders, cookie: 'session=inactive-token' } });
+      expect(response.statusCode).toBe(204);
+      expect(response.body).not.toContain('private session detail');
+      expect(String(response.headers['set-cookie'])).toContain('Max-Age=0');
+      await app.close();
+    },
+  );
+
+  it('allows repeated logout after the session was already revoked', async () => {
+    const { sessions, appPromise } = setup();
+    sessions.revokeSession
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new SessionError('already revoked', 'SESSION_REVOKED'));
+    const app = await appPromise;
+    for (let i = 0; i < 2; i++) {
+      const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...originHeaders, cookie: 'session=current-token' } });
+      expect(response.statusCode).toBe(204);
+    }
+    expect(sessions.revokeSession).toHaveBeenCalledTimes(2);
+    await app.close();
+  });
+
+  it('returns a generic service error on logout database failure and still clears the cookie', async () => {
+    const { sessions, appPromise } = setup();
+    sessions.revokeSession.mockRejectedValue(new SessionError('database internals', 'DATABASE_ERROR'));
+    const app = await appPromise;
+    const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { ...originHeaders, cookie: 'session=current-token' } });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Authentication service unavailable' } });
+    expect(response.body).not.toContain('database internals');
+    expect(String(response.headers['set-cookie'])).toContain('Max-Age=0');
+    await app.close();
+  });
+
+  it('protects logout with the existing same-origin check', async () => {
+    const { sessions, appPromise } = setup();
+    const app = await appPromise;
+    const response = await app.inject({ method: 'POST', url: '/api/auth/logout', headers: { origin: 'https://attacker.example', cookie: 'session=current-token' } });
+    expect(response.statusCode).toBe(403);
+    expect(sessions.revokeSession).not.toHaveBeenCalled();
+    expect(response.headers['set-cookie']).toBeUndefined();
+    await app.close();
+  });
+
+  it('returns only the authenticated public user at /me', async () => {
+    const { authentication, appPromise } = setup();
+    authentication.prisma.user.findUnique.mockResolvedValue({ ...publicUser, passwordHash: 'private-hash' });
+    const app = await appPromise;
+    const response = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: 'session=current-token' } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ user: { ...publicUser, createdAt: publicUser.createdAt.toISOString() } });
+    expect(response.body).not.toContain('passwordHash');
+    expect(response.body).not.toContain('private-hash');
+    expect(authentication.prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: publicSession.userId },
+      select: { id: true, name: true, email: true, createdAt: true },
+    });
+    await app.close();
+  });
+
+  it('uses middleware authentication errors for missing, expired, and revoked sessions at /me', async () => {
+    const missing = setup();
+    const missingApp = await missing.appPromise;
+    const noCookie = await missingApp.inject({ method: 'GET', url: '/api/auth/me' });
+    expect(noCookie.statusCode).toBe(401);
+    await missingApp.close();
+
+    for (const code of ['SESSION_EXPIRED', 'SESSION_REVOKED'] as const) {
+      const setupResult = setup();
+      setupResult.authentication.sessions.validateSession.mockRejectedValue(new SessionError('private session detail', code));
+      const app = await setupResult.appPromise;
+      const response = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: 'session=inactive-token' } });
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ error: { code: 'UNAUTHENTICATED', message: 'Authentication required' } });
+      expect(response.body).not.toContain('private session detail');
+      await app.close();
+    }
+  });
+
+  it('returns a generic service error for /me database failures', async () => {
+    const { authentication, appPromise } = setup();
+    authentication.sessions.validateSession.mockRejectedValue(new SessionError('database details', 'DATABASE_ERROR'));
+    const app = await appPromise;
+    const response = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: 'session=current-token' } });
+    expect(response.statusCode).toBe(503);
+    expect(response.body).not.toContain('database details');
+    await app.close();
+
+    const userLookup = setup();
+    userLookup.authentication.prisma.user.findUnique.mockRejectedValue(new Error('private user database details'));
+    const userApp = await userLookup.appPromise;
+    const userResponse = await userApp.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: 'session=current-token' } });
+    expect(userResponse.statusCode).toBe(503);
+    expect(userResponse.body).not.toContain('private user database details');
+    await userApp.close();
   });
 });
