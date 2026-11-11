@@ -3,12 +3,15 @@ import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import { registerAuthentication, type AuthenticationDependencies } from "./plugins/authentication.js";
 import { healthRoutes } from "./routes/health.js";
+import { authRoutes, type AuthRouteDependencies } from "./routes/auth.js";
 import "./config/env.js";
 import env from "./config/env.js";
 
 export type AppOptions = {
   frontendUrl?: string;
+  trustedProxyAddresses?: string[];
   authentication?: AuthenticationDependencies;
+  authRoutes?: AuthRouteDependencies;
 };
 
 export async function buildApp(options: AppOptions = {}): Promise<FastifyInstance> {
@@ -18,6 +21,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
 
   const app = Fastify({
     logger: true,
+    trustProxy: options.trustedProxyAddresses ?? env.TRUSTED_PROXY_ADDRESSES,
   });
 
   const frontendUrl = options.frontendUrl ?? env.FRONTEND_URL;
@@ -35,6 +39,7 @@ export async function buildApp(options: AppOptions = {}): Promise<FastifyInstanc
   }
 
   await app.register(healthRoutes);
+  if (options.authRoutes) await app.register(authRoutes, options.authRoutes);
 
   return app;
 }

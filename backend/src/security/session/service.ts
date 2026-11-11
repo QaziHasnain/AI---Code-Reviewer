@@ -21,6 +21,7 @@ const sessionSelect = {
 } as const;
 
 type SessionClient = Pick<PrismaClient, 'session'>;
+type SessionCreateDelegate = Pick<PrismaClient['session'], 'create'>;
 
 function validateRawToken(rawToken: string): void {
   if (typeof rawToken !== 'string' || rawToken.length === 0) {
@@ -38,13 +39,14 @@ export class SessionService {
   async createSession(
     userId: string,
     options: CreateSessionOptions = {},
+    sessionDelegate: SessionCreateDelegate = this.prisma.session,
   ): Promise<{ token: string; session: PublicSession }> {
     const now = options.now ?? new Date();
     const { token } = generateSessionToken();
     const { hash } = hashToken(token);
 
     try {
-      const session = await this.prisma.session.create({
+      const session = await sessionDelegate.create({
         data: {
           userId,
           tokenHash: hash,

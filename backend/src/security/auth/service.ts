@@ -15,12 +15,19 @@ const loginUserSelect = { ...publicUserSelect, passwordHash: true } as const;
 
 type UserForLogin = PublicUser & { passwordHash: string };
 type UserDelegate = Pick<PrismaClient['user'], 'create' | 'findUnique'>;
+type RegistrationTransaction = {
+  user: Pick<PrismaClient['user'], 'create'>;
+  session: Pick<PrismaClient['session'], 'create'>;
+};
 type SessionCreator = {
-  createSession(userId: string): Promise<{ token: string; session: PublicSession }>;
+  createSession(userId: string, options?: Record<string, never>, sessionDelegate?: RegistrationTransaction['session']): Promise<{ token: string; session: PublicSession }>;
 };
 
 export interface AuthServiceDependencies {
-  prisma: { user: UserDelegate };
+  prisma: {
+    user: UserDelegate;
+    $transaction<T>(callback: (transaction: RegistrationTransaction) => Promise<T>): Promise<T>;
+  };
   sessions: SessionCreator;
   hashPassword?: typeof hashPassword;
   verifyPassword?: typeof verifyPassword;
@@ -31,7 +38,17 @@ function operationFailed(): AuthError {
 }
 
 function isUniqueEmailError(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002';
+  if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'P2002' || !('meta' in error)) {
+    return false;
+  }
+
+  const metadata = error.meta;
+  if (typeof metadata !== 'object' || metadata === null || !('target' in metadata)) return false;
+
+  const target = metadata.target;
+  return target === 'email'
+    || target === 'User_email_key'
+    || (Array.isArray(target) && target.length === 1 && target[0] === 'email');
 }
 
 export class AuthService {
@@ -52,23 +69,19 @@ export class AuthService {
       throw new AuthError('Invalid registration details', 'INVALID_INPUT');
     }
 
-    let user: PublicUser;
     try {
-      user = await this.dependencies.prisma.user.create({
-        data: { name: input.name, email, passwordHash },
-        select: publicUserSelect,
-      }) as PublicUser;
+      return await this.dependencies.prisma.$transaction(async (transaction) => {
+        const user = await transaction.user.create({
+          data: { name: input.name, email, passwordHash },
+          select: publicUserSelect,
+        }) as PublicUser;
+        const session = await this.dependencies.sessions.createSession(user.id, {}, transaction.session);
+        return { user, session };
+      });
     } catch (error) {
       if (isUniqueEmailError(error)) {
         throw new AuthError('An account with this email already exists', 'EMAIL_ALREADY_EXISTS');
       }
-      throw operationFailed();
-    }
-
-    try {
-      const session = await this.dependencies.sessions.createSession(user.id);
-      return { user, session };
-    } catch {
       throw operationFailed();
     }
   }

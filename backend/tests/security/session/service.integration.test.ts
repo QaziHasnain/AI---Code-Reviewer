@@ -3,6 +3,7 @@ import { PrismaClient } from '@prisma/client';
 import { describe, expect, it } from 'vitest';
 import { SessionService, SESSION_LIFETIME_MS } from '@/security/session/index.js';
 import { hashToken } from '@/security/token/hash.js';
+import { AuthService } from '@/security/auth/service.js';
 
 const shouldRun = process.env.RUN_SESSION_DB_INTEGRATION_TESTS === 'true'
   && Boolean(process.env.TEST_DATABASE_URL);
@@ -48,6 +49,33 @@ describe.skipIf(!shouldRun)('SessionService PostgreSQL integration', () => {
       } finally {
         await prisma.$disconnect();
       }
+    }
+  });
+
+  it('atomically rolls back registration user and session rows when session creation fails after insert', async () => {
+    const prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+    const userId = randomUUID();
+    const email = `auth-rollback-${userId}@example.test`;
+    const tokenHash = hashToken(`rollback-${userId}`).hash;
+    const sessions = {
+      createSession: async (newUserId: string, _options: Record<string, never>, sessionDelegate: PrismaClient['session']) => {
+        await sessionDelegate.create({
+          data: { userId: newUserId, tokenHash, expiresAt: new Date(Date.now() + 60_000) },
+          select: { id: true, userId: true, expiresAt: true, createdAt: true, lastSeenAt: true, revokedAt: true, userAgent: true, ipHash: true },
+        });
+        throw new Error('simulated failure after session insert');
+      },
+    };
+    const service = new AuthService({ prisma, sessions });
+    try {
+      await expect(service.register({ name: 'Rollback Test', email, password: 'SecurePass123!' }))
+        .rejects.toMatchObject({ code: 'OPERATION_FAILED' });
+      await expect(prisma.user.findUnique({ where: { email } })).resolves.toBeNull();
+      await expect(prisma.session.findUnique({ where: { tokenHash } })).resolves.toBeNull();
+    } finally {
+      await prisma.session.deleteMany({ where: { tokenHash } });
+      await prisma.user.deleteMany({ where: { email } });
+      await prisma.$disconnect();
     }
   });
 });

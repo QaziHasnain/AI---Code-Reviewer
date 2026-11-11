@@ -22,10 +22,12 @@ function setup() {
     },
   };
   const sessions = { createSession: vi.fn().mockResolvedValue({ token: 'raw-session-token', session: publicSession }) };
+  const transactionSession = { create: vi.fn() };
+  const transaction = vi.fn(async (callback: (tx: { user: typeof prisma.user; session: typeof transactionSession }) => Promise<unknown>) => callback({ user: prisma.user, session: transactionSession }));
   const hash = vi.fn().mockResolvedValue({ hash: '$argon2id$private-hash', algorithm: 'argon2id' as const });
   const verify = vi.fn().mockResolvedValue({ valid: true, needsRehash: false });
-  const service = new AuthService({ prisma, sessions, hashPassword: hash, verifyPassword: verify });
-  return { prisma, sessions, hash, verify, service };
+  const service = new AuthService({ prisma: { ...prisma, $transaction: transaction }, sessions, hashPassword: hash, verifyPassword: verify });
+  return { prisma, sessions, hash, verify, service, transaction };
 }
 
 describe('AuthService registration', () => {
@@ -40,7 +42,7 @@ describe('AuthService registration', () => {
       data: { name: 'Reviewer', email: 'user@example.com', passwordHash: '$argon2id$private-hash' },
       select: { id: true, name: true, email: true, createdAt: true },
     }));
-    expect(sessions.createSession).toHaveBeenCalledWith(user.id);
+    expect(sessions.createSession).toHaveBeenCalledWith(user.id, {}, expect.anything());
     expect(result.user).toEqual(user);
     expect(result.user).not.toHaveProperty('passwordHash');
     expect(result).not.toHaveProperty('session.tokenHash');
@@ -55,11 +57,31 @@ describe('AuthService registration', () => {
       .rejects.toMatchObject({ code: 'EMAIL_ALREADY_EXISTS', message: 'An account with this email already exists' });
   });
 
+  it('does not map unrelated unique constraints to an email conflict', async () => {
+    const { prisma, service } = setup();
+    prisma.user.create.mockRejectedValue(Object.assign(new Error('private session constraint detail'), {
+      code: 'P2002', meta: { target: ['tokenHash'] },
+    }));
+    const error = await service.register({ name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' })
+      .catch((reason: unknown) => reason);
+    expect(error).toMatchObject({ code: 'OPERATION_FAILED', message: 'Authentication operation failed' });
+    expect(error).not.toMatchObject({ code: 'EMAIL_ALREADY_EXISTS' });
+    expect(String(error)).not.toContain('private session constraint detail');
+  });
+
   it('hides unexpected database errors', async () => {
     const { prisma, service } = setup();
     prisma.user.create.mockRejectedValue(new Error('postgres passwordHash leaked'));
     await expect(service.register({ name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' }))
       .rejects.toMatchObject({ code: 'OPERATION_FAILED', message: 'Authentication operation failed' });
+  });
+
+  it('runs user and session creation in one transaction and rolls both back on session failure', async () => {
+    const { sessions, service, transaction } = setup();
+    sessions.createSession.mockRejectedValue(new Error('database internals'));
+    await expect(service.register({ name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' }))
+      .rejects.toMatchObject({ code: 'OPERATION_FAILED' });
+    expect(transaction).toHaveBeenCalledTimes(1);
   });
 });
 
