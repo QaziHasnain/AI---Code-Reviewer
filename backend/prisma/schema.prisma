@@ -41,7 +41,8 @@ model CodeReview {
   createdAt           DateTime               @default(now())
   updatedAt           DateTime               @updatedAt
   user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  results             ReviewResult[]
+  result              ReviewResult?
+  job                 ReviewJob?
   idempotencyKeys     ReviewIdempotencyKey[]
 
   @@index([userId, createdAt, id])
@@ -66,7 +67,7 @@ model ReviewIdempotencyKey {
 // ReviewResult Model
 model ReviewResult {
   id                   String        @id @default(uuid()) @db.Uuid
-  codeReviewId         String        @db.Uuid
+  codeReviewId         String        @unique @db.Uuid
   outcome              ReviewOutcome
   score                Int
   summary              String
@@ -81,6 +82,25 @@ model ReviewResult {
   issues               ReviewIssue[]
 
   @@index([codeReviewId, createdAt])
+}
+
+model ReviewJob {
+  id             String          @id @default(uuid()) @db.Uuid
+  codeReviewId   String          @unique @db.Uuid
+  status         ReviewJobStatus @default(QUEUED)
+  availableAt    DateTime        @default(now())
+  attemptCount   Int             @default(0)
+  leaseToken     String?         @db.Uuid
+  leaseExpiresAt DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  lastErrorCode  String?         @db.VarChar(128)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  codeReview     CodeReview      @relation(fields: [codeReviewId], references: [id], onDelete: Cascade)
+
+  @@index([status, availableAt, createdAt])
+  @@index([status, leaseExpiresAt])
 }
 
 // ReviewIssue Model
@@ -162,6 +182,14 @@ enum ReviewStatus {
   COMPLETED
   FAILED
   CANCELLED
+}
+
+enum ReviewJobStatus {
+  QUEUED
+  PROCESSING
+  RETRY_WAIT
+  SUCCEEDED
+  DEAD
 }
 
 enum ReviewOutcome {

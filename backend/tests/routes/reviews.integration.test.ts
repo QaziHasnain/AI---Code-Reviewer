@@ -104,6 +104,38 @@ describe.skipIf(!shouldRun)('Code review PostgreSQL integration', () => {
     expect(reviewIds[0]).toBe(reviewIds[1]);
     expect(await prisma.codeReview.count({ where: { userId: primaryUser.id } })).toBe(1);
     expect(await prisma.reviewIdempotencyKey.count({ where: { userId: primaryUser.id, key: 'concurrent-key' } })).toBe(1);
+    expect(await prisma.reviewJob.count({ where: { codeReviewId: reviewIds[0], status: 'QUEUED' } })).toBe(1);
+  });
+
+  it('enforces one job per review in PostgreSQL', async () => {
+    const review = await prisma.codeReview.create({
+      data: { userId: primaryUser.id, sourceCode: 'const uniqueJob = true;', programmingLanguage: 'TYPESCRIPT' },
+      select: { id: true },
+    });
+    await prisma.reviewJob.create({ data: { codeReviewId: review.id } });
+    await expect(prisma.reviewJob.create({ data: { codeReviewId: review.id } })).rejects.toMatchObject({ code: 'P2002' });
+    expect(await prisma.reviewJob.count({ where: { codeReviewId: review.id } })).toBe(1);
+  });
+
+  it('enforces one final result per review in PostgreSQL', async () => {
+    const review = await prisma.codeReview.create({
+      data: { userId: primaryUser.id, sourceCode: 'const uniqueResult = true;', programmingLanguage: 'TYPESCRIPT' },
+      select: { id: true },
+    });
+    const data = {
+      codeReviewId: review.id,
+      outcome: 'PASS' as const,
+      score: 100,
+      summary: 'Integration result',
+      aiProvider: 'test',
+      aiModel: 'test-model',
+      promptTokenUsage: 1,
+      completionTokenUsage: 1,
+      processingDuration: 1,
+    };
+    await prisma.reviewResult.create({ data });
+    await expect(prisma.reviewResult.create({ data })).rejects.toMatchObject({ code: 'P2002' });
+    expect(await prisma.reviewResult.count({ where: { codeReviewId: review.id } })).toBe(1);
   });
 
   it('rejects a different payload for the same user-scoped idempotency key', async () => {
@@ -126,6 +158,7 @@ describe.skipIf(!shouldRun)('Code review PostgreSQL integration', () => {
   it('rolls back the review and idempotency record when the transaction fails', async () => {
     const rollbackService = new ReviewService({
       codeReview: prisma.codeReview,
+      reviewJob: prisma.reviewJob,
       reviewResult: prisma.reviewResult,
       reviewIssue: prisma.reviewIssue,
       reviewIdempotencyKey: prisma.reviewIdempotencyKey,
@@ -140,7 +173,33 @@ describe.skipIf(!shouldRun)('Code review PostgreSQL integration', () => {
       programmingLanguage: 'TYPESCRIPT',
     }, 'rollback-key')).rejects.toMatchObject({ code: 'STORAGE_UNAVAILABLE' });
     expect(await prisma.codeReview.count({ where: { userId: primaryUser.id } })).toBe(0);
+    expect(await prisma.reviewJob.count({ where: { codeReview: { userId: primaryUser.id } } })).toBe(0);
     expect(await prisma.reviewIdempotencyKey.count({ where: { userId: primaryUser.id, key: 'rollback-key' } })).toBe(0);
+  });
+
+  it('rolls back review and idempotency rows when job insertion fails', async () => {
+    const failingJobService = new ReviewService({
+      codeReview: prisma.codeReview,
+      reviewJob: prisma.reviewJob,
+      reviewResult: prisma.reviewResult,
+      reviewIssue: prisma.reviewIssue,
+      reviewIdempotencyKey: prisma.reviewIdempotencyKey,
+      $transaction: async (callback) => prisma.$transaction(async (transaction) => callback({
+        ...transaction,
+        reviewJob: {
+          ...transaction.reviewJob,
+          create: async () => { throw new Error('forced job insertion failure'); },
+        },
+      } as never)),
+    } as never);
+
+    await expect(failingJobService.createReview(primaryUser.id, {
+      sourceCode: 'const failedEnqueue = true;',
+      programmingLanguage: 'TYPESCRIPT',
+    }, 'failed-enqueue-key')).rejects.toMatchObject({ code: 'STORAGE_UNAVAILABLE' });
+    expect(await prisma.codeReview.count({ where: { userId: primaryUser.id } })).toBe(0);
+    expect(await prisma.reviewJob.count({ where: { codeReview: { userId: primaryUser.id } } })).toBe(0);
+    expect(await prisma.reviewIdempotencyKey.count({ where: { userId: primaryUser.id, key: 'failed-enqueue-key' } })).toBe(0);
   });
 
   it('does not expose reviews or results across users', async () => {

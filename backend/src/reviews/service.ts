@@ -48,11 +48,11 @@ const resultSelect = {
   },
 } satisfies Prisma.ReviewResultSelect;
 
-export type ReviewPrisma = Pick<PrismaClient, 'codeReview' | 'reviewResult' | 'reviewIssue' | 'reviewIdempotencyKey'> & {
+export type ReviewPrisma = Pick<PrismaClient, 'codeReview' | 'reviewJob' | 'reviewResult' | 'reviewIssue' | 'reviewIdempotencyKey'> & {
   $transaction<T>(callback: (transaction: ReviewTransaction) => Promise<T>): Promise<T>;
 };
 
-export type ReviewTransaction = Pick<PrismaClient, 'codeReview' | 'reviewIdempotencyKey'>;
+export type ReviewTransaction = Pick<PrismaClient, 'codeReview' | 'reviewJob' | 'reviewIdempotencyKey'>;
 
 export type ReviewSummary = Prisma.CodeReviewGetPayload<{ select: typeof reviewSelect }>;
 export type ReviewResultView = Prisma.ReviewResultGetPayload<{ select: typeof resultSelect }>;
@@ -149,6 +149,10 @@ export class ReviewService {
         }
 
         const review = await transaction.codeReview.create({ data, select: reviewSelect });
+        await transaction.reviewJob.create({
+          data: { codeReviewId: review.id, status: 'QUEUED' },
+          select: { id: true },
+        });
         if (idempotencyKey) {
           await transaction.reviewIdempotencyKey.create({
             data: { userId, key: idempotencyKey, requestHash: hash, codeReviewId: review.id },
@@ -221,13 +225,13 @@ export class ReviewService {
     try {
       const review = await this.prisma.codeReview.findFirst({
         where: { id: reviewId, userId },
-        select: { ...reviewSelect, results: { orderBy: { createdAt: 'desc' }, take: 1, select: resultSelect } },
+        select: { ...reviewSelect, result: { select: resultSelect } },
       });
       if (!review) throw new ReviewServiceError('Review not found', 'REVIEW_NOT_FOUND');
-      if (review.reviewStatus === 'COMPLETED' && !review.results[0]) {
+      if (review.reviewStatus === 'COMPLETED' && !review.result) {
         throw new ReviewServiceError('Completed review has no result', 'RESULT_MISSING');
       }
-      return { status: review.reviewStatus, result: review.results[0] ?? null };
+      return { status: review.reviewStatus, result: review.result };
     } catch (error) {
       if (error instanceof ReviewServiceError) throw error;
       throw new ReviewServiceError('Review storage is unavailable', 'STORAGE_UNAVAILABLE');
