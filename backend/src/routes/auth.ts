@@ -1,11 +1,13 @@
-import { createHmac } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { AuthError, AuthService, AUTHENTICATION_FAILED_MESSAGE, loginSchema, registerSchema } from '../security/auth/index.js';
 import { clearSessionCookie, getSessionCookieName, setSessionCookie } from '../security/auth/cookie.js';
+import { createAuthRateLimitKey, fixedWindow } from '../security/auth/rate-limit.js';
 import { SessionError } from '../security/session/index.js';
 
 const LOGIN_LIMIT = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const REGISTER_LIMIT = 5;
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 
 export interface AuthRouteDependencies {
   auth: AuthService;
@@ -61,6 +63,10 @@ export async function authRoutes(app: FastifyInstance, dependencies: AuthRouteDe
     const parsed = registerSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_INPUT', message: 'Invalid registration details' } });
     try {
+      const window = fixedWindow(Date.now(), REGISTER_WINDOW_MS);
+      const key = createAuthRateLimitKey(dependencies.rateLimitHmacSecret, 'register', request.ip, window.start);
+      const count = await dependencies.rateLimits.increment(key, window.expiresAt);
+      if (count > REGISTER_LIMIT) return rateLimited(reply, window.expiresAt);
       const result = await dependencies.auth.register(parsed.data);
       if (!await replacePreviousSession(dependencies, sessionCookie(request), result.session.token)) return safeError(reply, new Error('session replacement failed'));
       setSessionCookie(reply, result.session.token);
@@ -73,11 +79,10 @@ export async function authRoutes(app: FastifyInstance, dependencies: AuthRouteDe
     const parsed = loginSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: { code: 'INVALID_INPUT', message: 'Invalid login details' } });
     try {
-      const windowStart = Math.floor(Date.now() / LOGIN_WINDOW_MS) * LOGIN_WINDOW_MS;
-      const ipDigest = createHmac('sha256', Buffer.from(dependencies.rateLimitHmacSecret, 'hex'))
-        .update(`${request.ip}:${windowStart}`).digest('hex');
-      const count = await dependencies.rateLimits.increment(ipDigest, new Date(windowStart + LOGIN_WINDOW_MS));
-      if (count > LOGIN_LIMIT) return reply.code(429).header('retry-after', String(Math.ceil(LOGIN_WINDOW_MS / 1000))).send({ error: { code: 'RATE_LIMITED', message: 'Too many login attempts' } });
+      const window = fixedWindow(Date.now(), LOGIN_WINDOW_MS);
+      const key = createAuthRateLimitKey(dependencies.rateLimitHmacSecret, 'login', request.ip, window.start);
+      const count = await dependencies.rateLimits.increment(key, window.expiresAt);
+      if (count > LOGIN_LIMIT) return rateLimited(reply, window.expiresAt);
       const result = await dependencies.auth.login(parsed.data);
       if (!await replacePreviousSession(dependencies, sessionCookie(request), result.session.token)) return safeError(reply, new Error('session replacement failed'));
       setSessionCookie(reply, result.session.token);
@@ -117,4 +122,11 @@ export async function authRoutes(app: FastifyInstance, dependencies: AuthRouteDe
   }));
 }
 
+function rateLimited(reply: FastifyReply, expiresAt: Date): FastifyReply {
+  const retryAfterSeconds = Math.max(1, Math.ceil((expiresAt.getTime() - Date.now()) / 1000));
+  return reply.code(429).header('retry-after', String(retryAfterSeconds))
+    .send({ error: { code: 'RATE_LIMITED', message: 'Too many login attempts' } });
+}
+
 export const LOGIN_RATE_LIMIT = { limit: LOGIN_LIMIT, windowMs: LOGIN_WINDOW_MS } as const;
+export const REGISTER_RATE_LIMIT = { limit: REGISTER_LIMIT, windowMs: REGISTER_WINDOW_MS } as const;

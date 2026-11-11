@@ -5,7 +5,7 @@ import { buildApp } from "./app.js";
 import { SessionService } from "./security/session/index.js";
 import { startServer } from "./server-lifecycle.js";
 import { AuthService } from "./security/auth/index.js";
-import { createHash } from "node:crypto";
+import { PersistentAuthRateLimitStore } from "./security/auth/rate-limit-store.js";
 
 const port = Number(env.PORT);
 const host = env.HOST;
@@ -14,6 +14,7 @@ async function start(): Promise<void> {
   const prisma = new PrismaClient();
   const sessions = new SessionService(prisma);
   const auth = new AuthService({ prisma, sessions });
+  const rateLimitStore = new PersistentAuthRateLimitStore(prisma.authRateLimitBucket);
   await startServer({
     createApp: () => buildApp({
       frontendUrl: env.FRONTEND_URL,
@@ -24,17 +25,7 @@ async function start(): Promise<void> {
         sessions,
         frontendUrl: env.FRONTEND_URL,
         rateLimitHmacSecret: env.RATE_LIMIT_HMAC_SECRET,
-        rateLimits: {
-          increment: async (key, expiresAt) => {
-            await prisma.authRateLimitBucket.deleteMany({ where: { expiresAt: { lt: new Date() } } });
-            const bucketKey = createHash('sha256').update(key).digest('hex');
-            const bucket = await prisma.authRateLimitBucket.upsert({
-              where: { key: bucketKey }, create: { key: bucketKey, count: 1, expiresAt },
-              update: { count: { increment: 1 } }, select: { count: true },
-            });
-            return bucket.count;
-          },
-        },
+        rateLimits: rateLimitStore,
       },
     }),
     disconnectPrisma: () => prisma.$disconnect(),

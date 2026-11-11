@@ -5,6 +5,8 @@ import type { AuthService } from '@/security/auth/service.js';
 import { AuthError } from '@/security/auth/types.js';
 import type { PublicSession } from '@/security/session/types.js';
 import { SessionError } from '@/security/session/types.js';
+import { REGISTER_RATE_LIMIT, LOGIN_RATE_LIMIT } from '@/routes/auth.js';
+import { createAuthRateLimitKey, fixedWindow } from '@/security/auth/rate-limit.js';
 
 const publicUser = { id: 'user-id', name: 'Reviewer', email: 'user@example.com', createdAt: new Date('2030-01-01T00:00:00Z') };
 const publicSession: PublicSession = {
@@ -46,6 +48,53 @@ describe('authentication routes', () => {
     expect(response.headers['set-cookie']).toContain('session=new-secret-token');
     expect(auth.register).toHaveBeenCalledWith({ name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' });
     expect(sessions.revokeSession).toHaveBeenCalledWith('old-token');
+    await app.close();
+  });
+
+  it('applies the persistent registration limit and rejects excess attempts before creating a user or session', async () => {
+    expect(REGISTER_RATE_LIMIT).toEqual({ limit: 5, windowMs: 60 * 60 * 1000 });
+    const { auth, rateLimits, appPromise } = setup();
+    const app = await appPromise;
+    rateLimits.increment.mockResolvedValue(5);
+    const allowed = await app.inject({ method: 'POST', url: '/api/auth/register', headers: originHeaders, payload: { name: 'Reviewer', email: 'one@example.com', password: 'SecurePass123!' } });
+    expect(allowed.statusCode).toBe(201);
+    rateLimits.increment.mockResolvedValue(6);
+    const rejected = await app.inject({ method: 'POST', url: '/api/auth/register', headers: originHeaders, payload: { name: 'Reviewer', email: 'two@example.com', password: 'SecurePass123!' } });
+    expect(rejected.statusCode).toBe(429);
+    expect(rejected.json()).toEqual({ error: { code: 'RATE_LIMITED', message: 'Too many login attempts' } });
+    expect(rejected.headers['retry-after']).toMatch(/^\d+$/);
+    expect(auth.register).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
+  it('does not consume a registration bucket for invalid origin and fails closed on limiter database errors', async () => {
+    const { auth, rateLimits, appPromise } = setup();
+    const app = await appPromise;
+    const payload = { name: 'Reviewer', email: 'one@example.com', password: 'SecurePass123!' };
+    const forbidden = await app.inject({ method: 'POST', url: '/api/auth/register', headers: { origin: 'https://attacker.example' }, payload });
+    expect(forbidden.statusCode).toBe(403);
+    expect(rateLimits.increment).not.toHaveBeenCalled();
+    rateLimits.increment.mockRejectedValue(new Error('private database and bucket details'));
+    const unavailable = await app.inject({ method: 'POST', url: '/api/auth/register', headers: originHeaders, payload });
+    expect(unavailable.statusCode).toBe(503);
+    expect(unavailable.body).not.toContain('private database');
+    expect(unavailable.body).not.toContain('one@example.com');
+    expect(auth.register).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it('sets Retry-After from the remaining window at the time the limit response is sent', async () => {
+    const { rateLimits, appPromise } = setup();
+    const app = await appPromise;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_234_567);
+    rateLimits.increment.mockImplementation(async () => {
+      clock.mockReturnValue(1_300_001);
+      return 6;
+    });
+    const response = await app.inject({ method: 'POST', url: '/api/auth/register', headers: originHeaders, payload: { name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' } });
+    expect(response.statusCode).toBe(429);
+    expect(response.headers['retry-after']).toBe('2300');
+    clock.mockRestore();
     await app.close();
   });
 
@@ -182,19 +231,53 @@ describe('authentication routes', () => {
     await app.close();
   });
 
+  it('uses independent purpose-separated keys and accurate fixed-window expiration', async () => {
+    expect(LOGIN_RATE_LIMIT).toEqual({ limit: 10, windowMs: 15 * 60 * 1000 });
+    const secret = 'a'.repeat(64);
+    const loginKey = createAuthRateLimitKey(secret, 'login', '127.0.0.1', 900_000);
+    const registrationKey = createAuthRateLimitKey(secret, 'register', '127.0.0.1', 900_000);
+    expect(loginKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(registrationKey).toMatch(/^[a-f0-9]{64}$/);
+    expect(loginKey).not.toBe(registrationKey);
+    expect(loginKey).not.toContain('127.0.0.1');
+    expect(fixedWindow(1_234_567, 900_000)).toEqual({
+      start: 900_000,
+      expiresAt: new Date(1_800_000),
+    });
+  });
+
+  it('keeps registration and login counts independent', async () => {
+    const { rateLimits, auth, appPromise } = setup();
+    const app = await appPromise;
+    const payload = { name: 'Reviewer', email: 'user@example.com', password: 'SecurePass123!' };
+    await app.inject({ method: 'POST', url: '/api/auth/register', headers: originHeaders, payload });
+    await app.inject({ method: 'POST', url: '/api/auth/login', headers: originHeaders, payload: { email: payload.email, password: payload.password } });
+    const registerKey = rateLimits.increment.mock.calls[0][0];
+    const loginKey = rateLimits.increment.mock.calls[1][0];
+    expect(registerKey).not.toBe(loginKey);
+    expect(auth.register).toHaveBeenCalledTimes(1);
+    expect(auth.login).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
   it('uses forwarded IP only when the direct peer matches an explicitly trusted proxy', async () => {
     const secret = Buffer.from('a'.repeat(64), 'hex');
     const direct = setup([]);
     const directApp = await direct.appPromise;
     await directApp.inject({ method: 'POST', url: '/api/auth/login', headers: { ...originHeaders, 'x-forwarded-for': '198.51.100.8' }, payload: { email: 'user@example.com', password: 'SecurePass123!' } });
+    await directApp.inject({ method: 'POST', url: '/api/auth/register', headers: { ...originHeaders, 'x-forwarded-for': '198.51.100.8' }, payload: { name: 'Reviewer', email: 'new@example.com', password: 'SecurePass123!' } });
     const windowStart = Math.floor(Date.now() / (15 * 60 * 1000)) * (15 * 60 * 1000);
-    expect(direct.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`127.0.0.1:${windowStart}`).digest('hex'), expect.any(Date));
+    expect(direct.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`login:127.0.0.1:${windowStart}`).digest('hex'), expect.any(Date));
+    const hourStart = Math.floor(Date.now() / (60 * 60 * 1000)) * (60 * 60 * 1000);
+    expect(direct.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`register:127.0.0.1:${hourStart}`).digest('hex'), expect.any(Date));
     await directApp.close();
 
     const trusted = setup(['127.0.0.1']);
     const trustedApp = await trusted.appPromise;
     await trustedApp.inject({ method: 'POST', url: '/api/auth/login', headers: { ...originHeaders, 'x-forwarded-for': '198.51.100.8' }, payload: { email: 'user@example.com', password: 'SecurePass123!' } });
-    expect(trusted.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`198.51.100.8:${windowStart}`).digest('hex'), expect.any(Date));
+    await trustedApp.inject({ method: 'POST', url: '/api/auth/register', headers: { ...originHeaders, 'x-forwarded-for': '198.51.100.8' }, payload: { name: 'Reviewer', email: 'new@example.com', password: 'SecurePass123!' } });
+    expect(trusted.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`login:198.51.100.8:${windowStart}`).digest('hex'), expect.any(Date));
+    expect(trusted.rateLimits.increment).toHaveBeenCalledWith(createHmac('sha256', secret).update(`register:198.51.100.8:${hourStart}`).digest('hex'), expect.any(Date));
     await trustedApp.close();
   });
 
