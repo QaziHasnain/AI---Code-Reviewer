@@ -74,4 +74,75 @@ describe('review worker policy', () => {
     await expect((worker as unknown as { complete(job: typeof claim, result: ProviderResult, duration: number): Promise<void> }).complete(claim, output, 1)).resolves.toBeUndefined();
     expect(tx.reviewResult.create).not.toHaveBeenCalled();
   });
+
+  it('discards a delayed provider response after a newer lease has been acquired', async () => {
+    let releaseProvider!: (result: ProviderResult) => void;
+    let currentLease = claim.leaseToken;
+    const delayedProvider = {
+      analyze: vi.fn(() => new Promise<ProviderResult>((resolve) => { releaseProvider = resolve; })),
+    };
+    const tx = {
+      $queryRaw: vi.fn(async (_query: unknown) => currentLease === claim.leaseToken ? [{ id: claim.id }] : []),
+      reviewResult: { create: vi.fn(async () => ({ id: 'result' })) },
+      reviewIssue: { createMany: vi.fn(async () => ({ count: 0 })) },
+      $executeRaw: vi.fn(async () => 1),
+    };
+    const prisma = {
+      codeReview: { findUnique: vi.fn().mockResolvedValue({ id: 'review', programmingLanguage: 'TYPESCRIPT', sourceCode: 'x', instructions: null }) },
+      $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)),
+    } as unknown as PrismaClient;
+    const worker = new ReviewWorker(prisma, delayedProvider);
+
+    const oldProcessing = worker.process(claim);
+    await vi.waitFor(() => expect(delayedProvider.analyze).toHaveBeenCalledOnce());
+    currentLease = 'new-lease-token';
+    releaseProvider({ review: { outcome: 'PASS', score: 100, summary: 'late', issues: [] }, provider: 'fake', model: 'test', promptTokens: 0, completionTokens: 0 });
+    await oldProcessing;
+
+    expect(tx.reviewResult.create).not.toHaveBeenCalled();
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('processes one job at a time and shutdown waits for active provider work without claiming again', async () => {
+    let releaseProvider!: (result: ProviderResult) => void;
+    const providerStarted = Promise.withResolvers<void>();
+    const provider = {
+      analyze: vi.fn(() => {
+        providerStarted.resolve();
+        return new Promise<ProviderResult>((resolve) => { releaseProvider = resolve; });
+      }),
+    };
+    const tx = {
+      $queryRaw: vi.fn(async () => [{ id: claim.id }]),
+      reviewResult: { create: vi.fn(async () => ({ id: 'result' })) },
+      reviewIssue: { createMany: vi.fn(async () => ({ count: 0 })) },
+      $executeRaw: vi.fn(async () => 1),
+    };
+    const prisma = {
+      codeReview: { findUnique: vi.fn().mockResolvedValue({ id: 'review', programmingLanguage: 'TYPESCRIPT', sourceCode: 'x', instructions: null }) },
+      $transaction: vi.fn(async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx)),
+    } as unknown as PrismaClient;
+    const queue = {
+      recoverExpiredJobs: vi.fn(async () => ({ retried: 0, dead: 0 })),
+      claimNextJob: vi.fn(async () => claim),
+    };
+    const worker = new ReviewWorker(prisma, provider, queue as never);
+
+    const running = worker.run();
+    await providerStarted.promise;
+    expect(provider.analyze).toHaveBeenCalledOnce();
+    expect(queue.claimNextJob).toHaveBeenCalledOnce();
+
+    let shutdownFinished = false;
+    const shutdown = worker.shutdown().then(() => { shutdownFinished = true; });
+    await Promise.resolve();
+    expect(shutdownFinished).toBe(false);
+    expect(queue.claimNextJob).toHaveBeenCalledOnce();
+
+    releaseProvider({ review: { outcome: 'PASS', score: 100, summary: 'done', issues: [] }, provider: 'fake', model: 'test', promptTokens: 0, completionTokens: 0 });
+    await Promise.all([shutdown, running]);
+    expect(shutdownFinished).toBe(true);
+    expect(queue.claimNextJob).toHaveBeenCalledOnce();
+    expect(provider.analyze).toHaveBeenCalledOnce();
+  });
 });

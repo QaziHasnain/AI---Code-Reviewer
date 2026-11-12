@@ -1,6 +1,8 @@
-import { randomInt, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { LOGIN_RATE_LIMIT } from '@/routes/auth.js';
 import { AuthService } from '@/security/auth/service.js';
+import { createAuthRateLimitKey } from '@/security/auth/rate-limit.js';
 import { PersistentAuthRateLimitStore } from '@/security/auth/rate-limit-store.js';
 import { SessionService } from '@/security/session/index.js';
 import { assertDedicatedTestDatabase } from '../security/database-safety.js';
@@ -41,15 +43,20 @@ describe.skipIf(!shouldRun)('Authentication routes PostgreSQL integration', () =
       expect(await prisma.user.count({ where: { email } })).toBe(1);
       expect(await prisma.session.count({ where: { userId: user!.id } })).toBe(1);
 
-      const before = await prisma.authRateLimitBucket.count();
       const oversizedEmail = `oversized-${randomUUID()}@example.test`;
+      const oversizedRemoteAddress = `198.${randomInt(18, 20)}.${randomInt(0, 256)}.${randomInt(1, 255)}`;
+      const loginWindowStart = Math.floor(Date.now() / LOGIN_RATE_LIMIT.windowMs) * LOGIN_RATE_LIMIT.windowMs;
+      const relevantBucketKeys = [loginWindowStart - LOGIN_RATE_LIMIT.windowMs, loginWindowStart, loginWindowStart + LOGIN_RATE_LIMIT.windowMs]
+        .map((windowStart) => createHash('sha256').update(createAuthRateLimitKey(process.env.RATE_LIMIT_HMAC_SECRET!, 'login', oversizedRemoteAddress, windowStart)).digest('hex'));
+      const relevantBuckets = { key: { in: relevantBucketKeys } };
+      const before = await prisma.authRateLimitBucket.count({ where: relevantBuckets });
       const oversized = await app.inject({
-        method: 'POST', url: '/api/auth/login', remoteAddress,
+        method: 'POST', url: '/api/auth/login', remoteAddress: oversizedRemoteAddress,
         headers: { origin: 'http://localhost:3000' },
         payload: { email: oversizedEmail, password: 'x'.repeat(1_100_000) },
       });
       expect(oversized.statusCode).toBe(413);
-      expect(await prisma.authRateLimitBucket.count()).toBe(before);
+      expect(await prisma.authRateLimitBucket.count({ where: relevantBuckets })).toBe(before);
       expect(await prisma.user.findUnique({ where: { email: oversizedEmail } })).toBeNull();
     } finally {
       await app.close();

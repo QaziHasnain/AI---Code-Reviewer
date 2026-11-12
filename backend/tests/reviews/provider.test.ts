@@ -37,4 +37,20 @@ describe('review providers', () => {
     await expect(new GeminiReviewProvider('secret').analyze({ language: 'TYPESCRIPT', sourceCode: 'x' })).rejects.toMatchObject({ code: 'PROVIDER_UNAVAILABLE' });
     vi.unstubAllGlobals();
   });
+
+  it('classifies an elapsed provider request deadline as a retryable timeout', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('request aborted')), { once: true });
+    })));
+    try {
+      const pending = new GeminiReviewProvider('secret', 'test-model', 25).analyze({ language: 'TYPESCRIPT', sourceCode: 'x' });
+      const expectation = expect(pending).rejects.toMatchObject({ code: 'PROVIDER_TIMEOUT', retryable: true });
+      await vi.advanceTimersByTimeAsync(25);
+      await expectation;
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
 });
